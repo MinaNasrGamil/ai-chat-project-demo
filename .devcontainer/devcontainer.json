@@ -1,0 +1,5 @@
+{
+    "name": "ai-chat-project-demo-env",
+    "image": "mcr.microsoft.com/devcontainers/python:3.10",
+    "postCreateCommand": "python --version"
+}
