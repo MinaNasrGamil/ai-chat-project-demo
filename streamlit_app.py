@@ -28,11 +28,26 @@ def save_uploaded_pdf(uploaded_file) -> str:
     return dst_path
 
 
+# ----------------------- Auto Model Fallback -----------------------# ----------------------- Auto Model Fallback ---------------- break
+
+    if last_err and ("quota" in last_err.lower() or "RESOURCE_EXHAUSTED" in last_err):
+        return "[LLM] All free-tier quotas exhausted. Try later."
+
+    return f"[LLM] Error: {last_err}"
+FALLBACK_MODELS = [
+    "gemma-3-27b-it",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-2.0-flash-lite",
+    "gemini-2.5-flash",
+]
+
 def call_gemini(context: str, question: str) -> str:
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        return "[GEMINI] GEMINI_API_KEY is not set. Skipping LLM call."
+        return "[GEMINI] GEMINI_API_KEY is not set."
+
     client = genai.Client(api_key=api_key)
+
     prompt = f"""
 You are an AI assistant that answers questions ONLY based on the provided context.
 If the answer is not found in the context, say:
@@ -47,10 +62,24 @@ Context:
 {context}
 
 Answer:
-"""
-    resp = client.models.generate_content(
-        model="gemini-2.5-flash", contents=prompt)
-    return getattr(resp, "text", "").strip() or "(Empty response)"
+""".strip()
+
+    last_err = None
+
+    for model in FALLBACK_MODELS:
+        try:
+            resp = client.models.generate_content(model=model, contents=prompt)
+            return getattr(resp, "text", "").strip() or "(Empty response)"
+        except Exception as e:
+            msg = str(e)
+            last_err = msg
+            if (
+                "RESOURCE_EXHAUSTED" in msg
+                or "429" in msg
+                or "quota" in msg.lower()
+                or "NOT_FOUND" in msg
+            ):
+                continue
 
 
 def highlight_terms(text: str, terms: List[str]) -> str:

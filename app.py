@@ -1,12 +1,10 @@
-# app.py
+
 import os
 import re
 import glob
-import html
-import pickle
 import argparse
+import pickle
 import faiss
-import numpy as np
 from typing import Dict, List, Tuple
 from scipy.sparse import issparse
 from sklearn.preprocessing import normalize
@@ -22,6 +20,63 @@ DATA_DIR = "data"
 
 os.makedirs(STORE_DIR, exist_ok=True)
 os.makedirs(STORE_PER_DOC, exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
+
+
+FALLBACK_MODELS_DEFAULT = [
+    "gemma-3-27b-it",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-2.0-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-flash-lite-latest",
+    "gemini-flash-latest"
+]
+
+# Available models:
+# - aqa
+# - deep-research-pro-preview-12-2025
+# - gemini-2.0-flash
+# - gemini-2.0-flash-001
+# - gemini-2.0-flash-lite
+# - gemini-2.0-flash-lite-001
+# - gemini-2.5-computer-use-preview-10-2025
+# - gemini-2.5-flash
+# - gemini-2.5-flash-image
+# - gemini-2.5-flash-lite
+# - gemini-2.5-flash-lite-preview-09-2025
+# - gemini-2.5-flash-native-audio-latest
+# - gemini-2.5-flash-native-audio-preview-09-2025
+# - gemini-2.5-flash-native-audio-preview-12-2025
+# - gemini-2.5-flash-preview-tts
+# - gemini-2.5-pro
+# - gemini-2.5-pro-preview-tts
+# - gemini-3-flash-preview
+# - gemini-3-pro-image-preview
+# - gemini-3-pro-preview
+# - gemini-3.1-flash-image-preview
+# - gemini-3.1-flash-lite-preview
+# - gemini-3.1-pro-preview
+# - gemini-3.1-pro-preview-customtools
+# - gemini-embedding-001
+# - gemini-flash-latest
+# - gemini-flash-lite-latest
+# - gemini-pro-latest
+# - gemini-robotics-er-1.5-preview
+# - gemma-3-12b-it
+# - gemma-3-1b-it
+# - gemma-3-27b-it
+# - gemma-3-4b-it
+# - gemma-3n-e2b-it
+# - gemma-3n-e4b-it
+# - imagen-4.0-fast-generate-001
+# - imagen-4.0-generate-001
+# - imagen-4.0-ultra-generate-001
+# - nano-banana-pro-preview
+# - veo-2.0-generate-001
+# - veo-3.0-fast-generate-001
+# - veo-3.0-generate-001
+# - veo-3.1-fast-generate-preview
+# - veo-3.1-generate-preview
 
 
 def to_dense_l2(X):
@@ -80,11 +135,87 @@ def make_profile(name: str, chunks: List[str], pages, limit: int = 3) -> str:
     return profile[:1200]
 
 
+def is_short_query(q: str, max_terms: int = 2, max_len: int = 12) -> bool:
+    terms = [t for t in re.split(r"\W+", q) if t.strip()]
+    return (len(terms) <= max_terms) or (len(q.strip()) <= max_len)
+
+
+def list_available_models() -> List[str]:
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        return []
+    try:
+        client = genai.Client(api_key=api_key)
+        models = client.models.list()
+        names = []
+        for m in models:
+            # m.name is usually like "models/gemini-2.5-flash"
+            name = getattr(m, "name", "")
+            if not name:
+                continue
+            if name.startswith("models/"):
+                name = name.split("/", 1)[1]
+            names.append(name)
+        return sorted(set(names))
+    except Exception:
+        return []
+
+
+def resolve_model_chain(user_chain_csv: str) -> List[str]:
+    if user_chain_csv:
+        user_chain = [m.strip()
+                      for m in user_chain_csv.split(",") if m.strip()]
+    else:
+        user_chain = FALLBACK_MODELS_DEFAULT[:]
+
+    available = set(list_available_models())
+    if not available:
+        # If we cannot list, return user chain as-is (will try and may fail gracefully)
+        return user_chain
+
+    # Keep only models that exist in your project/quota
+    filtered = [m for m in user_chain if m in available]
+    # If nothing matched, fall back to first available "flash" style models
+    if not filtered:
+        fallback = [
+            m for m in available if "flash" in m and "tts" not in m and "vision" not in m]
+        filtered = fallback[:3] if fallback else user_chain
+    return filtered
+
+
+def try_models_with_fallback(prompt: str, chain: List[str]) -> Tuple[str, str]:
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        return "[LLM] GEMINI_API_KEY not set.", "N/A"
+
+    client = genai.Client(api_key=api_key)
+    last_err = None
+
+    for model in chain:
+        try:
+            resp = client.models.generate_content(model=model, contents=prompt)
+            txt = getattr(resp, "text", "").strip()
+            return txt if txt else "(Empty response)", model
+        except Exception as e:
+            msg = str(e)
+            last_err = msg
+            if ("RESOURCE_EXHAUSTED" in msg) or ("429" in msg) or ("quota" in msg.lower()) or ("NOT_FOUND" in msg) or ("is not found" in msg.lower()):
+                continue
+            break
+
+    if last_err:
+        if ("RESOURCE_EXHAUSTED" in last_err) or ("429" in last_err) or ("quota" in last_err.lower()):
+            return "[LLM] All free-tier quotas exhausted across selected models. Try later or change model.", "exhausted"
+        return f"[LLM] Error: {last_err}", "error"
+
+    return "[LLM] Unknown error.", "unknown"
+
+
 def ask(query: str,
         top_m: int = 2,
         k_per_doc: int = 3,
         top_k_global: int = 5,
-        min_route_score: float = 0.08,
+        min_route_score: float = 0.01,
         force_router: bool = False,
         force_docs: bool = False):
 
@@ -94,56 +225,54 @@ def ask(query: str,
 
     profiles: Dict[str, str] = {}
     per_doc: Dict[str, Dict] = {}
-    total_chunks = 0
 
     for pdf in pdfs:
         name = os.path.basename(pdf)
         chunks, pages = load_and_chunk(pdf)
-        vectorizer, index, texts = build_or_load_doc_index(
+        vect, index, texts = build_or_load_doc_index(
             name, chunks, force=force_docs)
-        per_doc[name] = {"vectorizer": vectorizer,
-                         "index": index, "texts": texts}
+        per_doc[name] = {"vectorizer": vect, "index": index, "texts": texts}
         profiles[name] = make_profile(name, chunks, pages)
-        total_chunks += len(chunks)
 
-    print(f"PDFs: {len(pdfs)} | Total Chunks: {total_chunks}")
+    if is_short_query(query):
+        merged = []
+        for doc_name, entry in per_doc.items():
+            qv = entry["vectorizer"].transform([query])
+            qv = to_dense_l2(qv)
+            k = min(k_per_doc, entry["index"].ntotal)
+            scores, idxs = entry["index"].search(qv, k)
+            for sc, i in zip(scores[0], idxs[0]):
+                merged.append((entry["texts"][i], float(sc), doc_name))
+        merged.sort(key=lambda x: x[1], reverse=True)
+        picked = merged[:top_k_global]
+        context = "\n\n---\n\n".join(re.sub(r'\s+', ' ',
+                                     t).strip()[:800] for (t, _, _) in picked)
+        routed_docs = [(doc, 0.0) for (_, _, doc) in picked]
+        return context, routed_docs, None
 
     router = Router()
     need_rebuild = force_router
     if not need_rebuild:
         try:
             router.load()
-            current_docs = set(profiles.keys())
-            if set(router.doc_names) != current_docs:
+            if set(router.doc_names) != set(profiles.keys()):
                 need_rebuild = True
-        except Exception:
+        except:
             need_rebuild = True
 
     if need_rebuild:
-        print("[Router] Rebuilding router index...")
         router.build(profiles).save()
-    else:
-        print("[Router] Loaded cached router index.")
 
-    routed = router.route(query, top_m=top_m, min_score=min_route_score)
-    print("\n[Routing] Top documents:")
-    if routed:
-        for doc, sc in routed:
-            print(
-                f"- {doc} (score={sc:.4f}) | terms: {router.explain_terms(query, doc)}")
-    else:
-        print("- None above threshold")
-
-    if not routed:
-        return None, None, "This information is not available in the provided documents."
+    routed = router.route(query, top_m=top_m,
+                          min_score=min_route_score, always_at_least_one=True)
 
     merged = []
     for doc, prior in routed:
         entry = per_doc[doc]
-        q = entry["vectorizer"].transform([query])
-        q = to_dense_l2(q)
+        qv = entry["vectorizer"].transform([query])
+        qv = to_dense_l2(qv)
         k = min(k_per_doc, entry["index"].ntotal)
-        scores, idxs = entry["index"].search(q, k)
+        scores, idxs = entry["index"].search(qv, k)
         for sc, i in zip(scores[0], idxs[0]):
             merged.append((entry["texts"][i], float(sc)
                           * (0.7 + 0.3 * prior), doc))
@@ -151,30 +280,40 @@ def ask(query: str,
     merged.sort(key=lambda x: x[1], reverse=True)
     picked = merged[:top_k_global]
 
-    def compact(s: str, max_len=800):
-        return re.sub(r'\s+', ' ', s).strip()[:max_len]
-
-    context = "\n\n---\n\n".join(compact(t) for (t, _, _) in picked)
+    context = "\n\n---\n\n".join(
+        re.sub(r'\s+', ' ', t).strip()[:800]
+        for (t, _, _) in picked
+    )
 
     return context, routed, None
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Routed multi-document RAG (PDF-only).")
+    parser = argparse.ArgumentParser(description="RAG CLI")
     parser.add_argument("--query", type=str,
                         default="What discount does RICRAC offer?")
     parser.add_argument("--top-m", type=int, default=2)
     parser.add_argument("--k-per-doc", type=int, default=3)
     parser.add_argument("--top-k-global", type=int, default=5)
-    parser.add_argument("--min-route-score", type=float, default=0.08)
-    parser.add_argument("--force", action="store_true",
-                        help="Force rebuild router and per-doc indices.")
-    parser.add_argument("--force-router", action="store_true",
-                        help="Force rebuild router only.")
-    parser.add_argument("--force-docs", action="store_true",
-                        help="Force rebuild per-doc indices only.")
+    parser.add_argument("--min-route-score", type=float, default=0.01)
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--force-router", action="store_true")
+    parser.add_argument("--force-docs", action="store_true")
+    parser.add_argument("--models", type=str, default="",
+                        help="Comma-separated model chain for fallback.")
+    parser.add_argument("--list-models", action="store_true",
+                        help="List available models for your key and exit.")
     args = parser.parse_args()
+
+    if args.list_models:
+        names = list_available_models()
+        if not names:
+            print("Could not list models (missing key or API error).")
+        else:
+            print("Available models:")
+            for n in names:
+                print(f"- {n}")
+        return
 
     force_router = args.force or args.force_router
     force_docs = args.force or args.force_docs
@@ -193,15 +332,16 @@ def main():
         print(err)
         return
 
-    print("\nClean Context:\n")
+    print("\n--- Clean Context ---\n")
     print(context)
 
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        print("\n[GEMINI] GEMINI_API_KEY is not set. Skipping LLM call.")
+    if not context or len(context.strip()) < 40:
+        print("\n--- AI Answer ---\n")
+        print("This information is not available in the provided documents.")
         return
 
-    client = genai.Client(api_key=api_key)
+    chain = resolve_model_chain(args.models)
+
     prompt = f"""
 You are an AI assistant that answers questions ONLY based on the provided context.
 If the answer is not found in the context, say:
@@ -216,11 +356,12 @@ Context:
 {context}
 
 Answer:
-"""
-    resp = client.models.generate_content(
-        model="gemini-2.5-flash", contents=prompt)
-    print("\nAI Answer:\n")
-    print(resp.text)
+""".strip()
+
+    answer, used_model = try_models_with_fallback(prompt, chain)
+    print("\n--- AI Answer ---\n")
+    print(answer)
+    print(f"\n[Used Model: {used_model}]")
 
 
 if __name__ == "__main__":
